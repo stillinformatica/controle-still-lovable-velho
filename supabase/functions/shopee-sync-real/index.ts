@@ -127,7 +127,13 @@ serve(async (req) => {
 
     const orders = await fetchShopeeOrders(creds, accessToken);
 
+    // Salva os pedidos no banco
     for (const order of orders) {
+      // Evita o erro "Invalid time value" caso create_time não venha na listagem (API v2 da Shopee)
+      const createTimeStr = order.create_time 
+        ? new Date(order.create_time * 1000).toISOString() 
+        : new Date().toISOString();
+
       const { error: orderErr } = await supabaseClient
         .from("shopee_orders")
         .upsert(
@@ -136,8 +142,8 @@ serve(async (req) => {
             shopee_order_sn: order.order_sn,
             order_status: order.order_status,
             customer_name: "Cliente Shopee",
-            total_amount: order.total_amount,
-            create_time: new Date(order.create_time * 1000).toISOString(),
+            total_amount: order.total_amount !== undefined ? order.total_amount : 0,
+            create_time: createTimeStr,
             updated_at: new Date().toISOString(),
           },
           { onConflict: "shopee_order_sn" }
