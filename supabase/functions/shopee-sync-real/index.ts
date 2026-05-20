@@ -9,10 +9,6 @@ const corsHeaders = {
 
 // ============================================================
 // CONFIGURAÇÃO DO PROXY DE IP FIXO
-// Adicione estas variáveis de ambiente no painel do Supabase:
-//   PROXY_URL      → ex: http://12.34.56.78:8080
-//   PROXY_USERNAME → seu usuário do proxy (opcional)
-//   PROXY_PASSWORD → sua senha do proxy (opcional)
 // ============================================================
 function createProxyClient(): Deno.HttpClient | undefined {
   const proxyUrl = Deno.env.get("PROXY_URL");
@@ -40,10 +36,9 @@ function createProxyClient(): Deno.HttpClient | undefined {
   });
 }
 
-// Cliente HTTP global com proxy (reutilizado em todas as requisições)
 const httpClient = createProxyClient();
 
-// Wrapper para fetch que usa o cliente com proxy quando disponível
+// deno-lint-ignore no-explicit-any
 async function proxiedFetch(url: string, options: RequestInit = {}): Promise<Response> {
   if (httpClient) {
     // deno-lint-ignore no-explicit-any
@@ -58,10 +53,9 @@ serve(async (req) => {
   }
 
   try {
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-    );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    const supabaseClient = createClient(supabaseUrl, supabaseKey);
 
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) throw new Error("Missing Authorization header");
@@ -94,11 +88,10 @@ serve(async (req) => {
       try {
         const tokenData = await exchangeAuthCode(creds);
 
-        // Fallback robusto para expiração do token (padrão Shopee de 4 horas se expire_in falhar)
         const expireInSeconds = Number(tokenData.expire_in);
         const expiresAt = !isNaN(expireInSeconds) && expireInSeconds > 0
           ? new Date(Date.now() + expireInSeconds * 1000)
-          : new Date(Date.now() + 4 * 60 * 60 * 1000); // 4 horas de padrão
+          : new Date(Date.now() + 4 * 60 * 60 * 1000);
 
         await supabaseClient
           .from("shopee_credentials")
@@ -122,18 +115,68 @@ serve(async (req) => {
           `Falha na autenticação com a Shopee: ${err.message}. Tente clicar em CONECTAR novamente.`
         );
       }
-    } else if ((!accessToken || isTokenExpired) && creds.refresh_token) {
-      console.log("Token expired and we have refresh_token...");
     }
 
     if (!accessToken)
       throw new Error("Authorization required. Please connect your shop again.");
 
-    const orders = await fetchShopeeOrders(creds, accessToken);
+    // 1. Busca a lista básica de pedidos (obtenção de IDs)
+    console.log("Iniciando busca da lista básica de pedidos da Shopee...");
+    const basicOrders = await fetchShopeeOrders(creds, accessToken);
+    
+    if (basicOrders.length === 0) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "Nenhum pedido encontrado no período informado.",
+          count: 0,
+        }),
+        {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
 
-    // Salva os pedidos no banco
-    for (const order of orders) {
-      // Evita o erro "Invalid time value" tratando qualquer formato de data (número, string ou nulo)
+    const orderSns = basicOrders.map((o: any) => o.order_sn).filter(Boolean);
+    console.log(`Encontrados ${orderSns.length} IDs de pedidos. Buscando detalhes...`);
+
+    // 2. Busca os detalhes completos para os pedidos encontrados (em lotes de 50)
+    let detailedOrders: any[] = [];
+    for (let i = 0; i < orderSns.length; i += 50) {
+      const chunk = orderSns.slice(i, i + 50);
+      try {
+        console.log(`Buscando detalhes do lote ${i / 50 + 1}...`);
+        const details = await fetchShopeeOrderDetails(creds, accessToken, chunk);
+        detailedOrders = detailedOrders.concat(details);
+      } catch (err) {
+        console.error(`Erro ao buscar detalhes para o lote ${i / 50 + 1}:`, err);
+      }
+    }
+
+    // 3. Descoberta dinâmica de colunas no banco do Supabase (OpenAPI)
+    // Isso evita qualquer erro de "coluna não existe" caso o usuário tenha um banco com campos personalizados
+    let dbColumns: string[] = [];
+    let properties: any = {};
+    try {
+      console.log("Descobrindo colunas da tabela shopee_orders dinamicamente...");
+      const schemaRes = await fetch(`${supabaseUrl}/rest/v1/`, {
+        headers: {
+          "apikey": supabaseKey,
+          "Accept": "application/openapi+json",
+        },
+      });
+      const schemaData = await schemaRes.json();
+      properties = schemaData.definitions?.shopee_orders?.properties || {};
+      dbColumns = Object.keys(properties);
+      console.log("Colunas encontradas no banco:", dbColumns);
+    } catch (e) {
+      console.error("Falha ao ler o schema do banco. Usando fallback básico.", e);
+      dbColumns = ["id", "user_id", "shopee_order_sn", "order_status", "customer_name", "total_amount", "create_time", "updated_at"];
+    }
+
+    // 4. Mapeia e salva os pedidos detalhados no Supabase
+    let upsertCount = 0;
+    for (const order of detailedOrders) {
       let createTimeStr = new Date().toISOString();
       if (order.create_time) {
         const parsedTime = Number(order.create_time);
@@ -147,29 +190,86 @@ serve(async (req) => {
         }
       }
 
+      // Monta o payload dinamicamente com base nas colunas que REALMENTE existem no banco
+      const payload: any = {
+        user_id: user.id,
+        shopee_order_sn: order.order_sn,
+        order_status: order.order_status,
+        updated_at: new Date().toISOString(),
+      };
+
+      if (dbColumns.includes("customer_name")) {
+        payload.customer_name = order.recipient_address?.name || "Cliente Shopee";
+      }
+      if (dbColumns.includes("total_amount")) {
+        payload.total_amount = order.total_amount !== undefined && order.total_amount !== null ? Number(order.total_amount) : 0;
+      }
+      if (dbColumns.includes("create_time")) {
+        payload.create_time = createTimeStr;
+      }
+
+      // Mapeamento dinâmico inteligente para campos de Endereço
+      if (dbColumns.includes("recipient_address")) {
+        const isJsonCol = typeof properties?.recipient_address?.type === "object" || properties?.recipient_address?.type === "array";
+        payload.recipient_address = isJsonCol ? order.recipient_address : (order.recipient_address?.full_address || JSON.stringify(order.recipient_address) || "");
+      }
+      if (dbColumns.includes("address")) {
+        payload.address = order.recipient_address?.full_address || "";
+      }
+
+      // Mapeamento dinâmico inteligente para Contato
+      if (dbColumns.includes("phone")) {
+        payload.phone = order.recipient_address?.phone || "";
+      }
+      if (dbColumns.includes("customer_phone")) {
+        payload.customer_phone = order.recipient_address?.phone || "";
+      }
+
+      // Mapeamento dinâmico inteligente para CPF
+      if (dbColumns.includes("cpf")) {
+        payload.cpf = order.buyer_cpf_id || "";
+      }
+      if (dbColumns.includes("buyer_cpf_id")) {
+        payload.buyer_cpf_id = order.buyer_cpf_id || "";
+      }
+
+      // Mapeamento de informações adicionais
+      if (dbColumns.includes("payment_method")) {
+        payload.payment_method = order.payment_method || "";
+      }
+      if (dbColumns.includes("shipping_carrier")) {
+        payload.shipping_carrier = order.shipping_carrier || "";
+      }
+      if (dbColumns.includes("cancel_reason")) {
+        payload.cancel_reason = order.cancel_reason || "";
+      }
+
+      // Lista de Itens do Pedido (Mapeamento inteligente para colunas JSON ou String)
+      if (dbColumns.includes("item_list")) {
+        const isJsonCol = typeof properties?.item_list?.type === "object" || properties?.item_list?.type === "array";
+        payload.item_list = isJsonCol ? order.item_list : JSON.stringify(order.item_list);
+      }
+      if (dbColumns.includes("items") && !payload.items) {
+        const isJsonCol = typeof properties?.items?.type === "object" || properties?.items?.type === "array";
+        payload.items = isJsonCol ? order.item_list : JSON.stringify(order.item_list);
+      }
+
       const { error: orderErr } = await supabaseClient
         .from("shopee_orders")
-        .upsert(
-          {
-            user_id: user.id,
-            shopee_order_sn: order.order_sn,
-            order_status: order.order_status,
-            customer_name: "Cliente Shopee",
-            total_amount: order.total_amount !== undefined && order.total_amount !== null ? Number(order.total_amount) : 0,
-            create_time: createTimeStr,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "shopee_order_sn" }
-        );
+        .upsert(payload, { onConflict: "shopee_order_sn" });
 
-      if (orderErr) console.error("Error upserting order:", orderErr);
+      if (orderErr) {
+        console.error(`Erro ao salvar pedido ${order.order_sn}:`, orderErr);
+      } else {
+        upsertCount++;
+      }
     }
 
     return new Response(
       JSON.stringify({
         success: true,
-        message: `${orders.length} pedidos reais sincronizados.`,
-        count: orders.length,
+        message: `${upsertCount} pedidos completos sincronizados com sucesso.`,
+        count: upsertCount,
         proxy_active: !!httpClient,
       }),
       {
@@ -209,8 +309,7 @@ async function exchangeAuthCode(creds: any) {
   );
   const url = `${SHOPEE_API_URL}${path}?partner_id=${creds.partner_id}&timestamp=${timestamp}&sign=${sign}`;
 
-  console.log(`[exchangeAuthCode] Requesting via proxy: ${url}`);
-  console.log(`[exchangeAuthCode] Body: ${JSON.stringify(body)}`);
+  console.log(`[exchangeAuthCode] Requesting: ${url}`);
 
   try {
     const res = await proxiedFetch(url, {
@@ -231,7 +330,7 @@ async function exchangeAuthCode(creds: any) {
       );
     }
 
-    if (data.error) {
+    if (data.error && data.error !== "") {
       console.error("[exchangeAuthCode] Shopee API Error response:", data);
       throw new Error(
         `Shopee API Error: ${data.message || data.error} (request_id: ${data.request_id})`
@@ -252,15 +351,14 @@ async function fetchShopeeOrders(creds: any, accessToken: string) {
   const timeTo = Math.floor(Date.now() / 1000);
 
   let allOrders: any[] = [];
-  let cursor = ""; // cursor vazio (sem aspas) para a primeira página
+  let cursor = "";
   let hasMore = true;
   let pageCount = 0;
 
-  while (hasMore && pageCount < 10) { // limite de 10 páginas (500 pedidos)
+  while (hasMore && pageCount < 10) {
     pageCount++;
     const timestamp = Math.floor(Date.now() / 1000);
 
-    // Monta os parâmetros — cursor vazio na 1ª página, valor retornado nas demais
     const params = new URLSearchParams({
       access_token: accessToken,
       page_size: "50",
@@ -272,7 +370,6 @@ async function fetchShopeeOrders(creds: any, accessToken: string) {
       timestamp: timestamp.toString(),
     });
 
-    // Só adiciona cursor se não for vazio (evita o erro "invalid cursor: cursorInt64")
     if (cursor) {
       params.append("cursor", cursor);
     }
@@ -288,19 +385,18 @@ async function fetchShopeeOrders(creds: any, accessToken: string) {
     params.append("sign", sign);
 
     const url = `${SHOPEE_API_URL}${path}?${params.toString()}`;
-    console.log(`[fetchShopeeOrders] Page ${pageCount}, cursor="${cursor}", URL: ${url}`);
+    console.log(`[fetchShopeeOrders] Page ${pageCount}, cursor="${cursor}"`);
 
     try {
       const res = await proxiedFetch(url);
       const text = await res.text();
-      console.log(`[fetchShopeeOrders] Page ${pageCount} raw response: ${text}`);
 
       let data: any;
       try {
         data = JSON.parse(text);
       } catch (e) {
         console.error(`[fetchShopeeOrders] Failed to parse JSON: ${text.substring(0, 200)}`);
-        throw new Error(`Resposta inválida da API da Shopee. Verifique as credenciais e o IP do proxy.`);
+        throw new Error(`Resposta inválida da API da Shopee.`);
       }
 
       if (data.error && data.error !== "" && data.error !== "error_none") {
@@ -311,20 +407,84 @@ async function fetchShopeeOrders(creds: any, accessToken: string) {
       const pageOrders = data.response?.order_list || [];
       allOrders = allOrders.concat(pageOrders);
 
-      // Verifica se há mais páginas
       const more = data.response?.more ?? false;
       cursor = data.response?.next_cursor ?? "";
       hasMore = more && !!cursor;
-
-      console.log(`[fetchShopeeOrders] Page ${pageCount}: ${pageOrders.length} pedidos, more=${more}, next_cursor="${cursor}"`);
     } catch (err) {
       console.error(`[fetchShopeeOrders] Request failed on page ${pageCount}: ${err.message}`);
       throw err;
     }
   }
 
-  console.log(`[fetchShopeeOrders] Total: ${allOrders.length} pedidos em ${pageCount} página(s).`);
   return allOrders;
+}
+
+async function fetchShopeeOrderDetails(creds: any, accessToken: string, orderSnList: string[]) {
+  const SHOPEE_API_URL = "https://partner.shopeemobile.com";
+  const path = "/api/v2/order/get_order_detail";
+  const shopId = parseInt(creds.shop_id);
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  // Lista robusta de todos os campos que o usuário deseja mapear
+  const optionalFields = [
+    "buyer_user_id",
+    "buyer_username",
+    "recipient_address",
+    "item_list",
+    "pay_time",
+    "buyer_cpf_id",
+    "shipping_carrier",
+    "payment_method",
+    "total_amount",
+    "invoice_data",
+    "cancel_reason",
+    "cancel_by"
+  ].join(",");
+
+  const params = new URLSearchParams({
+    access_token: accessToken,
+    partner_id: creds.partner_id,
+    shop_id: shopId.toString(),
+    timestamp: timestamp.toString(),
+    order_sn_list: orderSnList.join(","),
+    response_optional_fields: optionalFields,
+  });
+
+  const sign = await generateSign(
+    creds.partner_key,
+    creds.partner_id,
+    path,
+    timestamp,
+    accessToken,
+    shopId
+  );
+  params.append("sign", sign);
+
+  const url = `${SHOPEE_API_URL}${path}?${params.toString()}`;
+  console.log(`[fetchShopeeOrderDetails] URL: ${url}`);
+
+  try {
+    const res = await proxiedFetch(url);
+    const text = await res.text();
+
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.error(`[fetchShopeeOrderDetails] Failed to parse JSON: ${text.substring(0, 200)}`);
+      throw new Error(`Resposta inválida nos detalhes dos pedidos.`);
+    }
+
+    if (data.error && data.error !== "" && data.error !== "error_none") {
+      console.error(`[fetchShopeeOrderDetails] Shopee API error: ${JSON.stringify(data)}`);
+      throw new Error(`Shopee API Error Detail: ${data.message || data.error}`);
+    }
+
+    return data.response?.order_list || [];
+  } catch (err) {
+    console.error(`[fetchShopeeOrderDetails] Request failed: ${err.message}`);
+    throw err;
+  }
 }
 
 async function generateSign(
