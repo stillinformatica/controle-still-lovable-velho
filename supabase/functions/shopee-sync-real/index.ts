@@ -94,14 +94,18 @@ serve(async (req) => {
       try {
         const tokenData = await exchangeAuthCode(creds);
 
+        // Fallback robusto para expiração do token (padrão Shopee de 4 horas se expire_in falhar)
+        const expireInSeconds = Number(tokenData.expire_in);
+        const expiresAt = !isNaN(expireInSeconds) && expireInSeconds > 0
+          ? new Date(Date.now() + expireInSeconds * 1000)
+          : new Date(Date.now() + 4 * 60 * 60 * 1000); // 4 horas de padrão
+
         await supabaseClient
           .from("shopee_credentials")
           .update({
             access_token: tokenData.access_token,
             refresh_token: tokenData.refresh_token,
-            token_expires_at: new Date(
-              Date.now() + tokenData.expire_in * 1000
-            ).toISOString(),
+            token_expires_at: expiresAt.toISOString(),
             shop_id: (
               tokenData.shop_id ||
               (tokenData.shop_id_list && tokenData.shop_id_list[0]) ||
@@ -129,10 +133,19 @@ serve(async (req) => {
 
     // Salva os pedidos no banco
     for (const order of orders) {
-      // Evita o erro "Invalid time value" caso create_time não venha na listagem (API v2 da Shopee)
-      const createTimeStr = order.create_time 
-        ? new Date(order.create_time * 1000).toISOString() 
-        : new Date().toISOString();
+      // Evita o erro "Invalid time value" tratando qualquer formato de data (número, string ou nulo)
+      let createTimeStr = new Date().toISOString();
+      if (order.create_time) {
+        const parsedTime = Number(order.create_time);
+        if (!isNaN(parsedTime) && parsedTime > 0) {
+          createTimeStr = new Date(parsedTime * 1000).toISOString();
+        } else {
+          const parsedDate = new Date(order.create_time);
+          if (!isNaN(parsedDate.getTime())) {
+            createTimeStr = parsedDate.toISOString();
+          }
+        }
+      }
 
       const { error: orderErr } = await supabaseClient
         .from("shopee_orders")
@@ -142,7 +155,7 @@ serve(async (req) => {
             shopee_order_sn: order.order_sn,
             order_status: order.order_status,
             customer_name: "Cliente Shopee",
-            total_amount: order.total_amount !== undefined ? order.total_amount : 0,
+            total_amount: order.total_amount !== undefined && order.total_amount !== null ? Number(order.total_amount) : 0,
             create_time: createTimeStr,
             updated_at: new Date().toISOString(),
           },
